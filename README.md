@@ -5,7 +5,7 @@ It consists of the following main files:
 
 * road_network.h / road_network.cpp: core library
 * util.h / util.cpp: library with additional tools
-* main.cpp: run experiments on one or more graphs and summarize results
+* main.cpp: run experiments on one graph and summarize result
 
 ## Compile & Run
 
