@@ -13,7 +13,7 @@ Files can be compiled using `make`.
 Experiments can then be run with
 
 ```
-./cut [beta] graph_1.gr ... graph_n.gr
+./cut [beta] graph_name.gr
 ```
 
 The balance parameter `beta` is optional, with 0.15 as default.
