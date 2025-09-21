@@ -2253,12 +2253,11 @@ void Graph::update_up_par(size_t start, size_t end, const std::vector<NodeID>& n
                                                                   for (auto& f : futs) f.get();
                                                               }
 
-                                                              // keep original semantics
 
                                                               return;
                                                               remove_edge(u, v);
                                                               add_edge(u, v, before_w, true, true);
-                                                              // (The code below remains unreachable as in your original function.)
+                                                              //test time
                                                               for (size_t i = 0; i < num_threads; i++) {
                                                                   for (auto p : change[i]) {
                                                                       NodeID cut = p.first.first;
