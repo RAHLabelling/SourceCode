@@ -18,3 +18,5 @@ Experiments can then be run with
 
 The balance parameter `beta` is optional, with 0.15 as default.
 Graph files for testing, as well as a description of the expected file format, can be found at http://www.diag.uniroma1.it/~challenge9/download.shtml.
+
+The A* and subtree-pruning ideas were not fully included in the paper, yet they embody some of the most elegant theoretical insights behind RAHL.
