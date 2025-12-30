@@ -14,6 +14,7 @@
 #include <random>
 #include <mutex>
 #include <set>
+#include <immintrin.h>
 using namespace std;
 #define ll long long
 #define pb push_back
@@ -164,7 +165,7 @@ bool CutIndex::empty() const
     return dist_index.empty();
 }
 
-// need to implement distance calculation (for given cut level) using CutIndex as it's used to identify redundant shortcuts
+
 static distance_t get_cut_level_distance(const CutIndex &a, const CutIndex &b, size_t cut_level)
 {
     distance_t min_dist = infinity;
@@ -529,125 +530,173 @@ distance_t ContractionIndex::test_time(NodeID v, NodeID w, uint16_t offset) cons
     return min_dist;
 }
 
-
-distance_t ContractionIndex::get_distance(NodeID v, NodeID w, uint16_t offset) const
+static inline __attribute__((always_inline))
+uint32_t hmin256_epu32(__m256i v)
 {
-    // 1. ǰ��������ͬ partition ����·��
-    ContractionLabel cv = labels[v];
-    ContractionLabel cw = labels[w];
-    assert(!cv.cut_index.empty() && !cw.cut_index.empty());
+    // 先把 high 128 和 low 128 做 min
+    __m256i v2 = _mm256_permute2x128_si256(v, v, 0x01);
+    v = _mm256_min_epu32(v, v2);
+
+    // 128-bit lane 内部归约 (AVX2 的 shuffle 是 lane-local 的)
+    __m256i shuf = _mm256_shuffle_epi32(v, _MM_SHUFFLE(2,3,0,1));
+    v = _mm256_min_epu32(v, shuf);
+    shuf = _mm256_shuffle_epi32(v, _MM_SHUFFLE(1,0,3,2));
+    v = _mm256_min_epu32(v, shuf);
+
+    return (uint32_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(v));
+}
+
+// 专用 kernel：返回 min_i (a[i] + b[i])
+static inline __attribute__((always_inline))
+uint32_t min_sum_u32_simd_avx2(
+    const uint32_t* __restrict a,
+    const uint32_t* __restrict b,
+    size_t n,
+    uint32_t inf)
+{
+    if (n == 0) return inf;
+
+    // 小 n（<=7）很多时候标量更快（maskload 可能是微码/更高延迟）
+    // 如果你特别想 1..7 也强制 SIMD，把这个 if 删掉即可。
+    if (n <= 7) {
+        uint32_t best = inf;
+        #pragma GCC unroll 8
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t s = a[i] + b[i];
+            best = (s < best) ? s : best;
+        }
+        return best;
+    }
+
+    const __m256i v_inf = _mm256_set1_epi32((int)inf);
+
+    // 4 路独立累加器，减少依赖链，提高吞吐
+    __m256i vmin0 = v_inf, vmin1 = v_inf, vmin2 = v_inf, vmin3 = v_inf;
+
+    size_t i = 0;
+
+    // 主循环：每次处理 32 个 uint32
+    for (; i + 32 <= n; i += 32) {
+        __m256i a0 = _mm256_loadu_si256((const __m256i_u*)(a + i));
+        __m256i b0 = _mm256_loadu_si256((const __m256i_u*)(b + i));
+        vmin0 = _mm256_min_epu32(vmin0, _mm256_add_epi32(a0, b0));
+
+        __m256i a1 = _mm256_loadu_si256((const __m256i_u*)(a + i + 8));
+        __m256i b1 = _mm256_loadu_si256((const __m256i_u*)(b + i + 8));
+        vmin1 = _mm256_min_epu32(vmin1, _mm256_add_epi32(a1, b1));
+
+        __m256i a2 = _mm256_loadu_si256((const __m256i_u*)(a + i + 16));
+        __m256i b2 = _mm256_loadu_si256((const __m256i_u*)(b + i + 16));
+        vmin2 = _mm256_min_epu32(vmin2, _mm256_add_epi32(a2, b2));
+
+        __m256i a3 = _mm256_loadu_si256((const __m256i_u*)(a + i + 24));
+        __m256i b3 = _mm256_loadu_si256((const __m256i_u*)(b + i + 24));
+        vmin3 = _mm256_min_epu32(vmin3, _mm256_add_epi32(a3, b3));
+    }
+
+    __m256i vmin = _mm256_min_epu32(
+        _mm256_min_epu32(vmin0, vmin1),
+        _mm256_min_epu32(vmin2, vmin3)
+    );
+
+    // 剩余的整块 8 个
+    for (; i + 8 <= n; i += 8) {
+        __m256i va = _mm256_loadu_si256((const __m256i_u*)(a + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i_u*)(b + i));
+        vmin = _mm256_min_epu32(vmin, _mm256_add_epi32(va, vb));
+    }
+
+    // tail：1..7 个，用 maskload 保证不越界，且不走标量循环
+    const unsigned r = (unsigned)(n - i);
+    if (r) {
+        const __m256i idx = _mm256_setr_epi32(0,1,2,3,4,5,6,7);
+        const __m256i m   = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)r), idx);
+
+        __m256i va  = _mm256_maskload_epi32((const int*)(a + i), m);
+        __m256i vb  = _mm256_maskload_epi32((const int*)(b + i), m);
+        __m256i sum = _mm256_add_epi32(va, vb);
+
+        // mask off 的 lane maskload 给 0，必须改成 inf，否则 min 会被 0 污染
+        sum = _mm256_blendv_epi8(v_inf, sum, m);
+        vmin = _mm256_min_epu32(vmin, sum);
+    }
+
+    return hmin256_epu32(vmin);
+}
+
+
+distance_t ContractionIndex::get_distance(NodeID v, NodeID w, uint16_t /*offset*/) const
+{
+    // ================= 1. 同 Partition 处理 (保持原逻辑) =================
+    const ContractionLabel& cv = labels[v];
+    const ContractionLabel& cw = labels[w];
 
     if (cv.cut_index == cw.cut_index)
     {
-        // ͬһ partition���������ָ����� LCA ���
-        if (v == w)
-            return 0;
-        if (cv.distance_offset == 0)
-            return cw.distance_offset;
-        if (cw.distance_offset == 0)
-            return cv.distance_offset;
-        if (cv.parent == w)
-            return cv.distance_offset - cw.distance_offset;
-        if (cw.parent == v)
-            return cw.distance_offset - cv.distance_offset;
+        if (v == w) return 0;
+        if (cv.distance_offset == 0) return cw.distance_offset;
+        if (cw.distance_offset == 0) return cv.distance_offset;
+        if (cv.parent == w) return cv.distance_offset - cw.distance_offset;
+        if (cw.parent == v) return cw.distance_offset - cv.distance_offset;
 
-        // Ѱ����͹�������
         NodeID v_anc = v, w_anc = w;
         ContractionLabel cv_anc = cv, cw_anc = cw;
         while (v_anc != w_anc)
         {
-            if (cv_anc.distance_offset < cw_anc.distance_offset)
-            {
+            if (cv_anc.distance_offset < cw_anc.distance_offset) {
                 w_anc = cw_anc.parent;
                 cw_anc = labels[w_anc];
-            }
-            else if (cv_anc.distance_offset > cw_anc.distance_offset)
-            {
+            } else if (cv_anc.distance_offset > cw_anc.distance_offset) {
                 v_anc = cv_anc.parent;
                 cv_anc = labels[v_anc];
-            }
-            else
-            {
+            } else {
                 v_anc = cv_anc.parent;
                 w_anc = cw_anc.parent;
                 cv_anc = labels[v_anc];
                 cw_anc = labels[w_anc];
             }
         }
-        return cv.distance_offset + cw.distance_offset
-            - 2 * cv_anc.distance_offset;
+        return cv.distance_offset + cw.distance_offset - 2 * cv_anc.distance_offset;
     }
 
-    // 2. ��ͬ partition������ 2-hop ������Сֵ
-    FlatCutIndex a = cv.cut_index;
-    FlatCutIndex b = cw.cut_index;
-    size_t cut_level = PBV::lca_level(
+    // ================= 2. 准备数据指针（减少拷贝 & 减少重复调用） =================
+    const FlatCutIndex& a = cv.cut_index;
+    const FlatCutIndex& b = cw.cut_index;
+
+    const size_t cut_level = PBV::lca_level(
         *a.partition_bitvector(),
         *b.partition_bitvector()
     );
 
-    uint16_t a_offset = get_offset(a.dist_index(), cut_level);
-    uint16_t b_offset = get_offset(b.dist_index(), cut_level);
+    const auto* __restrict a_idx = a.dist_index();
+    const auto* __restrict b_idx = b.dist_index();
+
+    const uint16_t a_offset = get_offset(a_idx, cut_level);
+    const uint16_t b_offset = get_offset(b_idx, cut_level);
 
     const distance_t* __restrict pa = a.distances() + a_offset;
     const distance_t* __restrict pb = b.distances() + b_offset;
-    size_t total = std::min(
-        a.dist_index()[cut_level] - a_offset,
-        b.dist_index()[cut_level] - b_offset
+
+    const size_t a_end = (size_t)a_idx[cut_level];
+    const size_t b_end = (size_t)b_idx[cut_level];
+
+    const size_t total = std::min(a_end - (size_t)a_offset, b_end - (size_t)b_offset);
+    if (__builtin_expect(total == 0, 0)) return infinity;
+
+    // ================= 3. SIMD Kernel：min_i(pa[i]+pb[i]) =================
+    static_assert(sizeof(distance_t) == 4, "SIMD kernel assumes 32-bit distance_t");
+
+    const uint32_t best = min_sum_u32_simd_avx2(
+        reinterpret_cast<const uint32_t*>(pa),
+        reinterpret_cast<const uint32_t*>(pb),
+        total,
+        (uint32_t)infinity
     );
 
-    distance_t best = infinity;
-
-    // 3. �������ԣ�С(<20)����(21�C60)����(>60)
-    if (total <= 20)
-    {
-        // С��ģ��չ�� 4 ��
-#pragma GCC ivdep
-#pragma GCC unroll 4
-        for (size_t i = 0; i < total; ++i)
-        {
-            distance_t d = pa[i] + pb[i];
-            if (d < best) best = d;
-        }
-    }
-    else if (total <= 60)
-    {
-        // �й�ģ��չ�� 8 ��
-#pragma GCC ivdep
-#pragma GCC unroll 8
-        for (size_t i = 0; i < total; ++i)
-        {
-            distance_t d = pa[i] + pb[i];
-            if (d < best) best = d;
-        }
-    }
-    else
-    {
-        // ���ģ�������ֿ飬���С 64 Ԫ��
-        constexpr size_t BLOCK = 64;
-        size_t o = 0;
-        // ����չ�� 8 ��
-        for (; o + BLOCK <= total; o += BLOCK)
-        {
-#pragma GCC ivdep
-#pragma GCC unroll 8
-            for (size_t j = 0; j < BLOCK; ++j)
-            {
-                distance_t d = pa[o + j] + pb[o + j];
-                if (d < best) best = d;
-            }
-        }
-        // ����β������һ�����Ԫ��
-        for (size_t i = o; i < total; ++i)
-        {
-            distance_t d = pa[i] + pb[i];
-            if (d < best) best = d;
-        }
-    }
-
-    // 4. �������վ���
-    return best + cv.distance_offset + cw.distance_offset;
+    // ================= 4. 加起点终点 Offset =================
+    return (distance_t)best + cv.distance_offset + cw.distance_offset;
 }
+
 
 
 size_t ContractionIndex::get_hoplinks(NodeID v, NodeID w) const
